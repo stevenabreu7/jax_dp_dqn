@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+DG-27s-and-1s500ms-noisy-u
+
 # C extensions
 *.so
 
