@@ -1,3 +1,5 @@
 gym
 jax
 flax
+optax
+tqdm

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 DG-27s-and-1s500ms-noisy-u
+_archive
 
 # C extensions
 *.so
