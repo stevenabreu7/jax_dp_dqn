@@ -182,6 +182,13 @@ def load_data(folder):
     Y = np.array(Y)
     return X, Y
 
+def load_train_test_data_27s():
+    folder = 'DG-27s-and-1s500ms-noisy-u/Recordings/Train/Train-27s'
+    x_train, y_train = load_data(folder)
+    folder = 'DG-27s-and-1s500ms-noisy-u/Recordings/Test/Test-27s'
+    x_test, y_test = load_data(folder)
+    return x_train, y_train, x_test, y_test
+
 def load_train_test_data():
     folder = 'DG-27s-and-1s500ms-noisy-u/Recordings/Train/Train-1s500ms'
     x_train, y_train = load_data(folder)
@@ -191,8 +198,14 @@ def load_train_test_data():
 
 # ------------------------------------------------------------------------------
 
-def train_model(hidden_size, memory_size, theta, epochs=500):
-    x_train, y_train, x_test, y_test = load_train_test_data()
+def train_model(hidden_size, memory_size, theta, epochs=500, data='500ms'):
+    if data == '500ms':
+        print('using 500ms data')
+        x_train, y_train, x_test, y_test = load_train_test_data()
+    else:
+        print('using 27s data')
+        x_train, y_train, x_test, y_test = load_train_test_data_27s()
+
     model = LMUModel(input_size=7, output_size=1, hidden_size=hidden_size, 
                      memory_size=memory_size, theta=theta)
     optimizer = torch.optim.Adam(model.parameters())
@@ -214,7 +227,7 @@ def train_model(hidden_size, memory_size, theta, epochs=500):
                 ypr = model(x)
                 loss_train.append(loss(ypr, y).item())
             loss_test = []
-            for batch_idx in range(x_test.shape[0] // batch_size):
+            for batch_idx in range(max(1, x_test.shape[0] // batch_size)):
                 model.eval()
                 x = x_test[batch_idx*batch_size:(batch_idx+1)*batch_size]
                 y = y_test[batch_idx*batch_size:(batch_idx+1)*batch_size]
