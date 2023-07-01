@@ -1,54 +1,41 @@
 import flax
+import flax.linen as nn
 import gym
 import jax
 import jax.numpy as jnp
-import numpy as np
+import optax
+import rlax
 import random
 
 from collections import namedtuple, deque
-from flax import nn
-from jax import jit, vmap, partial
+from flax.training import train_state
+from jax import jit, vmap
+from tqdm import tqdm
 
-from model import MLP
+from dqn_model import MLP
 
-Experience = namedtuple("experience", field_names=["state", "action", "reward", 
-												   "next_state", "done"])
+Params = namedtuple("params", "policy target")
+Experience = namedtuple("experience", "state action reward next_state done")
+ExpCfg = namedtuple("exp_cfg", "env_name architecture n_episodes n_steps batch_size replay_size learning_rate target_update_frequency gamma eps_schedule")
+
 
 class ReplayBuffer:
 	"""Replay buffer to store and sample experience tuples."""
 
-	def __init__(self, buffer_size, batch_size, seed):
-		""" Initialize a ReplayBuffer object.
-
-		Args:
-			buffer_size (int): maximum size of buffer
-			batch_size (int): size of each sampled training batch
-			seed (int): random seed
-		"""
-		self.memory = deque(maxlen=buffer_size)
-		self.batch_size = batch_size
+	def __init__(self, buffer_size, seed):
 		random.seed(seed)
+		self.memory = deque(maxlen=buffer_size)
 
 	def add(self, state, action, reward, next_state, done):
-		# state      = jnp.expand_dims(state, 0)
-		# next_state = jnp.expand_dims(next_state, 0)
 		e = Experience(state, action, reward, next_state, done)
 		self.memory.append(e)
 
-	def sample(self):
-		"""Randomly sample a batch of experiences from memory.
-
-		Returns:
-			states (jnp.array): batch of states
-			actions (jnp.array): batch of actions
-			rewards (jnp.array): batch of rewards
-			next_states (jnp.array): batch of next states
-			dones (jnp.array): batch of done flags
-		"""
-		s, a, r, n, d = zip(*random.sample(self.memory, k=self.batch_size))
+	def sample(self, batch_size):
+		"""Randomly sample a batch of experiences from memory."""
+		s, a, r, n, d = zip(*random.sample(self.memory, k=batch_size))
 		return (
-			jnp.vstack(s).float(), jnp.vstack(a).long(), jnp.vstack(r).float(),
-			jnp.vstack(n).float(), jnp.vstack(d).astype(jnp.uint8).float()
+			jnp.vstack(s, dtype=float), jnp.vstack(a, dtype=int), jnp.vstack(r, dtype=float),
+			jnp.vstack(n, dtype=float), jnp.vstack(d, dtype=float)
 		)
 
 	def __len__(self):
@@ -56,123 +43,171 @@ class ReplayBuffer:
 
 
 @jit
-def policy(key, x, model, epsilon, num_actions):
-	"""Epsilon-greedy policy. Maps state to action.
-
-	Args:
-		key (jax.random.PRNGKey): random key
-		x (jnp.array): state
-		model (nn.Module): model mapping state to action
-		epsilon (float): probability of random action
-		num_actions (int): number of possible actions
-	"""
-	prob_rnd = jax.random.uniform(key)
-	# model-predicted q-values for all actions
-	q = jnp.squeeze(model(jnp.expand_dims(x, axis=0)))
-	# TODO: use jax.lax.cond instead of if-else
-	# rnd = partial(rand, num_actions=num_actions)
-	# a = jax.lax.cond(prob < epsilon, key, rnd, q, jnp.argmax)
-	# if prob_rnd < epsilon, choose random action, else greedy action
-	if prob_rnd < epsilon:
-		return jax.random.randint(key, (1,), 0, num_actions)[0]
-	else:
-		return jnp.argmax(q)
+def policy(key, state, trainstate, epsilon, greedy=False):
+	"""Epsilon-greedy policy. Maps state to action."""
+	state = jnp.expand_dims(state, axis=0)
+	q = jnp.squeeze(trainstate.apply_fn(trainstate.params, state))
+	a_eps = rlax.epsilon_greedy(epsilon).sample(key, q)
+	a_grd = rlax.greedy().sample(key, q)
+	action = jax.lax.select(greedy, a_grd, a_eps)
+	return action
 
 @vmap
-def q_learning_loss(q, target_q, action, action_select, reward, done, gamma):
+def q_learning_loss(q, target_q, action, reward, done, gamma):
 	"""Compute q-learning loss through TD-learning."""
-	td_target = reward + gamma*(1.- done)*target_q[action_select]
+	td_target = reward + gamma*target_q.max()*(1.-done)
+	td_error = jax.lax.stop_gradient(td_target) - q[action]
+	return td_error**2
+
+@vmap
+def double_q_learning_loss(q, target_q, action, action_select, reward, done, gamma):
+	"""Compute double q-learning loss through TD-learning (action selected by policy network)."""
+	td_target = reward + gamma*target_q[action_select]*(1.-done)
 	td_error = jax.lax.stop_gradient(td_target) - q[action]
 	return td_error**2
 
 @jit
-def train_step(optimizer, target_model: flax.linen.Module, batch, gamma=0.9):
-	"""Perform a single training step, i.e. compute loss and update model parameters.
-
-	Args:
-		optimizer (jax.experimental.optimizers.Optimizer): optimizer
-		target_model (flax.linen.Module): target model
-		batch (tuple(jnp.array)): batch of experiences
-	
-	Returns:
-		optimizer (jax.experimental.optimizers.Optimizer): updated optimizer
-		loss (jnp.array): loss value
-	"""
-	def loss_fn(model: flax.linen.Module):
+def train_step(trainstate, target_params, batch, gamma=0.9):
+	"""Perform a single training step, i.e. compute loss and update model parameters."""
+	def loss_fn(policy_params):
 		"""Compute avg loss for a batch of experiences."""
 		state, action, reward, next_state, done = batch
-		q = model(state)
-		target_q = target_model(next_state)
-		action_select = model(next_state).argmax(-1)
-		return jnp.mean(q_learning_loss(q, target_q, action, action_select, reward, done, gamma))
+		q = trainstate.apply_fn(policy_params, state)
+		target_q = trainstate.apply_fn(target_params, next_state)
+		action_select = trainstate.apply_fn(policy_params, next_state).argmax(-1)
+		g = jnp.array([gamma] * state.shape[0])
+		return jnp.mean(double_q_learning_loss(q, target_q, action, action_select, reward, done, g))
 
 	# compute loss and gradients, then apply gradients
-	loss, grad = jax.value_and_grad(loss_fn)(optimizer.target)
-	optimizer = optimizer.apply_gradient(grad)
-	return optimizer, loss
+	loss, grad = jax.value_and_grad(loss_fn)(trainstate.params)
+	trainstate = trainstate.apply_gradients(grads=grad)
+	return trainstate, loss
 
 
-def run_experiment(
-		env_name = 'CartPole-v1', 
-		architecture = [512],
-		num_episodes=1000, 
-		num_steps=50,
-		batch_size=32, 
-		replay_size=1000, 
-		target_update_frequency=10,
-		gamma=0.9):
+class DQNAgent:
+	def __init__(self, cfg: ExpCfg, seed=0) -> None:
+		# create environment and replay buffer
+		self.env = gym.make(cfg.env_name)
+		self.replay_buffer = ReplayBuffer(cfg.replay_size, seed=0)
+		# stored properties
+		self.cfg = cfg
+		self.key = jax.random.PRNGKey(seed)
+		self.n_actions = self.env.action_space.n
+		self.n_state = self.env.observation_space.shape[0]
+		# network and parameters
+		self.network = MLP([self.n_state] + cfg.architecture + [self.n_actions])
+		state, _ = self.env.reset()
+		self.target_params = self.network.init(self.key, jnp.expand_dims(state, axis=0))
+		# training state
+		self.eps_fn = optax.polynomial_schedule(*cfg.eps_schedule, transition_steps=cfg.n_episodes)
+		self.trainstate = train_state.TrainState.create(
+			apply_fn=self.network.apply,
+			params=self.network.init(self.key, jnp.expand_dims(state, axis=0)),
+			tx=optax.adam(cfg.learning_rate)
+		)
+	
+	def train(self):
+		mean_loss_per_episode = []
+		reward_per_episode = []
 
-	# Create environment
-	env = gym.make(env_name)
-	replay_buffer = ReplayBuffer(replay_size)
+		for episode in tqdm(range(self.cfg.n_episodes)):
+			state, _ = self.env.reset()
+			ep_reward = 0
+			ep_loss = []
+
+			for t in range(self.cfg.n_steps):
+				epsilon = self.eps_fn(t)
+				action = policy(self.key, state, self.trainstate, epsilon)
+				next_state, reward, done, _, _ = self.env.step(int(action))
+				self.replay_buffer.add(state, action, reward, next_state, done)
+				ep_reward += reward
+
+				if len(self.replay_buffer) > self.cfg.batch_size:
+					batch = self.replay_buffer.sample(self.cfg.batch_size)
+					self.trainstate, loss = train_step(self.trainstate, self.target_params, 
+													   batch, self.cfg.gamma)
+					ep_loss.append(float(loss))
+
+				if t % self.cfg.target_update_frequency == 0:
+					self.target_params = self.trainstate.params
+				
+				if done: break
+
+				state = next_state
+			
+			mean_loss_per_episode.append(jnp.array(ep_loss).mean())
+			reward_per_episode.append(ep_reward)
+		
+		return jnp.array(mean_loss_per_episode), jnp.array(reward_per_episode)
+
+	def eval(self, n_episodes=100, epsilon=0.05):
+		reward_per_episode = []
+
+		for episode in tqdm(range(n_episodes)):
+			ep_reward = 0
+			state, _ = self.env.reset()
+
+			for t in range(self.cfg.n_steps):
+				action = policy(self.key, state, self.trainstate, epsilon)
+				state, reward, done, _, _ = self.env.step(int(action))
+				ep_reward += reward
+				if done: break
+			reward_per_episode.append(ep_reward)
+
+		return jnp.array(reward_per_episode)
+
+def run_experiment(cfg: ExpCfg):
+	# create environment
+	env = gym.make(cfg.env_name)
+	replay_buffer = ReplayBuffer(cfg.replay_size, seed=0)
 
 	# logging
-	ep_losses = []
-	ep_rewards = []
+	mean_loss_per_episode = []
+	reward_per_episode = []
 	key = jax.random.PRNGKey(0)
 
 	# Build and initialize the action selection and target network.
 	num_actions = env.action_space.n
 	state, _ = env.reset()
 
-	# initialize the model
-	model = MLP([state.shape[0]] + architecture + [num_actions])
-	_, initial_params = model.init(key, jnp.expand_dims(state, axis=0))
-	model = nn.Model(model, initial_params)
+	# initialize the model and optimizer
+	network = MLP([state.shape[0]] + cfg.architecture + [num_actions])
+	target_params = network.init(key, jnp.expand_dims(state, axis=0))
+	optimizer = optax.adam(cfg.learning_rate)
+	epsilon_by_frame = optax.polynomial_schedule(*cfg.eps_schedule, transition_steps=cfg.n_episodes)
+	trainstate = train_state.TrainState.create(
+		apply_fn=network.apply, params= network.init(key, jnp.expand_dims(state, axis=0)), 
+		tx=optimizer
+	)
 
-	# initialize the target network
-	target_model = nn.Model(model, initial_params)
+	for episode in tqdm(range(cfg.n_episodes)):
 
-	# build and initialize optimizer
-	optimizer = flax.optim.Adam(1e-3).create(model)
+		# Initialize episode
+		state, _ = env.reset()
+		ep_reward = 0
+		mean_ep_loss = []
 
-	for n in range(num_episodes):
-		state = env.reset()
-
-		# Initialize statistics
-		ep_reward = 0.
-
-		for t in range(num_steps):
+		for t in range(cfg.n_steps):
 			# generate an action from the agent's policy
-			epsilon = 0.1 # epsilon_by_frame(n)
-			action = policy(key, state, optimizer.target, epsilon, num_actions)  
+			epsilon = epsilon_by_frame(t)
+			action = policy(key, state, trainstate, epsilon, num_actions)
 
 			# step the environment
-			next_state, reward, done, _ = env.step(int(action))
+			next_state, reward, done, _, _ = env.step(int(action))
 
 			# store to replay buffer, update episode reward
-			replay_buffer.push(state, action, reward, next_state, done)
+			replay_buffer.add(state, action, reward, next_state, done)
 			ep_reward += reward
 
 			# update value model when there's enough data
-			if len(replay_buffer) > batch_size:
-				batch = replay_buffer.sample(batch_size)
-				optimizer, loss = train_step(optimizer, target_model, batch, gamma)
-				ep_losses.append(float(loss))
+			if len(replay_buffer) > cfg.batch_size:
+				batch = replay_buffer.sample(cfg.batch_size)
+				trainstate, loss = train_step(trainstate, target_params, batch, cfg.gamma)
+				mean_ep_loss.append(float(loss))
 
-			#Update Target model parameters
-			if t % target_update_frequency == 0:
-				target_model = target_model.replace(params=optimizer.target.params)
+			# update target model parameters
+			if t % cfg.target_update_frequency == 0:
+				target_params = trainstate.params
 
 			# Terminate episode when absorbing state reached.
 			if done: break
@@ -181,200 +216,33 @@ def run_experiment(
 			state = next_state
 
 		# Update episodic statistics
-		ep_rewards.append(ep_reward)
+		mean_loss_per_episode.append(jnp.array(mean_ep_loss).mean())
+		reward_per_episode.append(ep_reward)
 
-		if n % 100 == 0:
-			print("Episode #{}, Return {}, Loss {}".format(n, ep_reward, loss))
+	return trainstate.params, jnp.array(reward_per_episode), jnp.array(mean_loss_per_episode)
 
-	return optimizer.target, ep_rewards, ep_losses
+def eval_agent(cfg: ExpCfg, params, epsilon=0.05):
+	env = gym.make(cfg.env_name)
+	key = jax.random.PRNGKey(0)
 
+	state, _ = env.reset()
+	num_actions = env.action_space.n
+	network = MLP([state.shape[0]] + cfg.architecture + [num_actions])
+	netstate = train_state.TrainState.create(
+		apply_fn=network.apply, params=params, tx=optax.adam(.0)
+	)
 
-class Agent:
-	def __init__(self, env, policy_net, target_net, architecture, batch_size, memory_size, gamma,
-				 eps_start, eps_end, eps_decay, update_every, target_update_frequency, optimizer,
-				 learning_rate, num_episodes, max_steps, i_run, result_dir, seed, tau,
-				 spiking=False, two_neuron=False):
+	reward_per_episode = []
 
-		self.env = gym.make(env)
-		self.env.seed(seed)
+	for _ in tqdm(range(cfg.n_episodes)):
+		state, _ = env.reset()
+		ep_reward = 0
+		done = False
+		for _ in range(cfg.n_steps):
+			action = policy(key, state, netstate, epsilon, num_actions)
+			state, reward, done, _, _ = env.step(int(action))
+			ep_reward += reward
+			if done: break
+		reward_per_episode.append(ep_reward)
 
-		random.seed(seed)
-		# torch.manual_seed(seed)
-
-		self.policy_net = policy_net
-		self.target_net = target_net
-
-		self.architecture = architecture
-		self.batch_size = batch_size
-		self.memory_size = memory_size
-		self.gamma = gamma
-		self.eps_start = eps_start
-		self.eps_end = eps_end
-		self.eps_decay = eps_decay
-		self.update_every = update_every
-		self.target_update_frequency = target_update_frequency
-		self.optimizer = optimizer
-		self.learning_rate = learning_rate
-		self.num_episodes = num_episodes
-		self.max_steps = max_steps
-		self.i_run = i_run
-		self.result_dir = result_dir
-		self.tau = tau
-		self.spiking = spiking
-		# self.random = random
-		self.two_neuron = two_neuron
-
-		# Initialize Replay Memory
-		self.memory = ReplayBuffer(self.memory_size, self.batch_size, seed)
-
-		# Initialize time step
-		self.t_step = 0
-		self.t_step_total = 0
-
-	def select_action(self, state, eps=0.):
-		# state = torch.from_numpy(state)
-		# state = state.unsqueeze(0).to(device)
-		state = jax.lax.stop_gradient(state)
-		if random.random() > eps:
-			if self.spiking:
-				final_layer_values = self.policy_net.forward(state.float())[0].\
-					cpu().data.numpy()
-				return np.argmax(final_layer_values)
-			else:
-				return np.argmax(self.policy_net.forward(state.float())[0].cpu().data.numpy())
-		else:
-			return random.choice(np.arange(self.architecture[-1]))
-
-	def step(self, state, action, reward, next_state, done):
-		self.memory.add(state, action, reward, next_state, done)
-
-		# Learn every UPDATE_EVERY time steps.
-		self.t_step = (self.t_step + 1) % self.update_every
-		if self.t_step == 0:
-			# If enough samples are available in memory, get random subset and learn
-			if len(self.memory) > self.batch_size:
-				experiences = self.memory.sample()
-				self.optimize_model(experiences)
-
-	def optimize_model(self, experiences):
-		states, actions, rewards, next_states, dones = experiences
-
-		# Get max predicted Q values (for next states) from target model
-		if self.spiking:
-			Q_targets_next = self.target_net.forward(next_states)[0].detach().max(1)[0].unsqueeze(1)
-		else:
-			Q_targets_next = self.target_net(next_states).detach().max(1)[0].unsqueeze(1)
-
-		# Compute Q targets for current states
-		Q_targets = rewards + (self.gamma * Q_targets_next*(1 - dones))
-
-		# Get expected Q values from local model
-		if self.spiking:
-			Q_expected = self.policy_net.forward(states)[0].gather(1, actions)
-		else:
-			Q_expected = self.policy_net.forward(states).gather(1, actions)
-
-		# Compute loss
-		loss = (Q_expected - Q_targets).mean() ** 
-		# Minimize the loss
-		self.optimizer.zero_grad()
-		loss.backward(retain_graph=True)
-
-		self.optimizer.step()
-		if self.t_step_total % self.target_update_frequency == 0:
-			self.soft_update()
-
-	def soft_update(self):
-		self.target_net.load_state_dict(self.policy_net.state_dict())
-
-	def transform_state(self, state):
-		state_ = []
-		for i in state:
-			if i > 0:
-				state_.append(i)
-				state_.append(0)
-			else:
-				state_.append(0)
-				state_.append(abs(i))
-		return np.array(state_)
-
-	def train_agent(self):
-		best_average = -jnp.inf
-		best_average_after = jnp.inf
-		scores = []
-		smoothed_scores = []
-		scores_window = deque(maxlen=100)
-		eps = self.eps_start
-
-		for i_episode in range(1, self.num_episodes + 1):
-			state = self.env.reset()
-			if self.two_neuron:
-				state = self.transform_state(state)
-			score = 0
-			done = False
-			while not done:
-				self.t_step_total += 1
-				action = self.select_action(state, eps)
-				next_state, reward, done, _ = self.env.step(action)
-				if self.two_neuron:
-					next_state = self.transform_state(next_state)
-				self.step(state, action, reward, next_state, done)
-				state = next_state
-				score += reward
-				eps = max(self.eps_end, self.eps_decay * eps)
-				if done:
-					break
-			scores_window.append(score)
-			scores.append(score)
-			smoothed_scores.append(jnp.mean(scores_window))
-
-			if smoothed_scores[-1] > best_average:
-				best_average = smoothed_scores[-1]
-				best_average_after = i_episode
-				if self.spiking:
-					jnp.save(self.policy_net.state_dict(),
-							   self.result_dir + '/checkpoint_DSQN_{}.npy'.format(self.i_run))
-				else:
-					jnp.save(self.policy_net.state_dict(),
-							   self.result_dir + '/checkpoint_DQN_{}.npy'.format(self.i_run))
-
-			print("Episode {}\tAverage Score: {:.2f}\t Epsilon: {:.2f}".
-				  format(i_episode, jnp.mean(scores_window), eps), end='\r')
-
-			if i_episode % 100 == 0:
-				print("\rEpisode {}\tAverage Score: {:.2f}".
-					  format(i_episode, jnp.mean(scores_window)))
-
-		print('Best 100 episode average: ', best_average, ' reached at episode ',
-			  best_average_after, '. Model saved in folder best.')
-		return smoothed_scores, scores, best_average, best_average_after
-
-
-def evaluate_agent(policy_net, env, num_episodes, max_steps, gym_seeds, epsilon=0):
-	"""
-
-	"""
-	rewards = []
-
-	for i_episode in range(num_episodes):
-		env.seed(int(gym_seeds[i_episode]))
-		env._max_episode_steps = max_steps
-		state = env.reset()
-		state = state.float() #.unsqueeze(0)
-		total_reward = 0
-		for t in range(max_steps):
-			if random.random() >= epsilon:
-				final_layer_values = policy_net.forward(state.float())[0].cpu().data.numpy()
-				action = jnp.argmax(final_layer_values)
-			else:
-				action = random.randint(0, env.action_space.n - 1)
-
-			observation, reward, done, _ = env.step(action)
-			state = observation.float() #.unsqueeze(0)
-			total_reward += reward
-			if done:
-				break
-		rewards.append(total_reward)
-		print("Episode: {}".format(i_episode), end='\r')
-
-	return rewards
+	return jnp.array(reward_per_episode)
